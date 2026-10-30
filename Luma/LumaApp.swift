@@ -67,6 +67,18 @@ struct PhotoItem: Identifiable, Codable {
 
 enum Renderer {
     static let context = CIContext(options: [.cacheIntermediates: false])
+    static func automaticAdjustments(url: URL) -> Adjustments? {
+        guard let source = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]),
+              let average = CIFilter(name: "CIAreaAverage", parameters: [kCIInputImageKey: source, kCIInputExtentKey: CIVector(cgRect: source.extent)])?.outputImage else { return nil }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        context.render(average, toBitmap: &pixel, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+        let brightness = (0.2126 * Double(pixel[0]) + 0.7152 * Double(pixel[1]) + 0.0722 * Double(pixel[2])) / 255.0
+        var result = Adjustments()
+        result.exposure = min(0.8, max(-0.6, (0.43 - brightness) * 1.6))
+        result.shadows = brightness < 0.35 ? 0.22 : 0.12
+        result.highlights = brightness > 0.65 ? 0.68 : 0.85
+        return result
+    }
     static func image(url: URL, adjustments a: Adjustments, maxDimension: CGFloat? = nil) -> UIImage? {
         guard var image = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return nil }
         if let maxDimension = maxDimension {
@@ -89,8 +101,11 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
     private let output = AVCapturePhotoOutput()
     @Published var ready = false
     @Published var message: String?
+    @Published var zoom: Double = 1
+    @Published var maxZoom: Double = 1
     var onCapture: ((Data, Bool) -> Void)?
     private var configured = false
+    private var currentInput: AVCaptureDeviceInput?
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: configure()
@@ -113,15 +128,48 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
                     return
                 }
                 self.session.addInput(input)
+                self.currentInput = input
                 self.session.addOutput(self.output)
                 self.session.commitConfiguration()
                 self.configured = true
+                DispatchQueue.main.async { self.maxZoom = min(5, Double(device.activeFormat.videoMaxZoomFactor)) }
             }
             if !self.session.isRunning { self.session.startRunning() }
             DispatchQueue.main.async { self.ready = true }
         }
     }
     func stop() { queue.async { if self.session.isRunning { self.session.stopRunning() }; DispatchQueue.main.async { self.ready = false } } }
+    func setZoom(_ value: Double) {
+        queue.async {
+            guard let device = self.currentInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                let factor = min(device.activeFormat.videoMaxZoomFactor, max(device.minAvailableVideoZoomFactor, CGFloat(value)))
+                device.videoZoomFactor = factor
+                device.unlockForConfiguration()
+                DispatchQueue.main.async { self.zoom = Double(factor) }
+            } catch { DispatchQueue.main.async { self.message = "Could not change zoom." } }
+        }
+    }
+    func flip() {
+        queue.async {
+            guard let previous = self.currentInput else { return }
+            let position: AVCaptureDevice.Position = previous.device.position == .back ? .front : .back
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position), let next = try? AVCaptureDeviceInput(device: device) else {
+                DispatchQueue.main.async { self.message = "That camera is unavailable." }; return
+            }
+            self.session.beginConfiguration()
+            self.session.removeInput(previous)
+            if self.session.canAddInput(next) {
+                self.session.addInput(next); self.currentInput = next
+                DispatchQueue.main.async { self.zoom = 1; self.maxZoom = min(5, Double(device.activeFormat.videoMaxZoomFactor)); self.message = nil }
+            } else {
+                self.session.addInput(previous)
+                DispatchQueue.main.async { self.message = "Could not switch cameras." }
+            }
+            self.session.commitConfiguration()
+        }
+    }
     func capture() {
         queue.async {
             guard self.session.isRunning else { return }
@@ -176,7 +224,7 @@ struct CameraScreen: View {
                 ZStack {
                     CameraPreview(session: camera.session).clipShape(RoundedRectangle(cornerRadius: 6))
                     if let message = camera.message { Text(message).multilineTextAlignment(.center).padding().background(.black.opacity(0.8)).cornerRadius(12).padding() }
-                    VStack { Spacer(); HStack { Text("VIEWFINDER").font(.system(size: 9, weight: .semibold)).tracking(2); Spacer(); Text("01").font(.caption.monospacedDigit()) }.foregroundStyle(.white.opacity(0.75)).padding(16) }
+                    VStack { Spacer(); HStack { Image(systemName: "minus.magnifyingglass"); Slider(value: Binding(get: { camera.zoom }, set: { camera.setZoom($0) }), in: 1...max(1.01, camera.maxZoom)).tint(.white).accessibilityLabel("Camera zoom"); Text(String(format: "%.1f×", camera.zoom)).font(.caption.monospacedDigit()).frame(width: 38) }.padding(12).background(.black.opacity(0.55)).clipShape(Capsule()).padding(16) }
                 }.padding(.horizontal, 12)
                 HStack {
                     Button { showGallery = true } label: {
@@ -184,7 +232,7 @@ struct CameraScreen: View {
                     }.frame(maxWidth: .infinity).accessibilityLabel("Open gallery")
                     Button { camera.capture() } label: { Circle().stroke(.white, lineWidth: 3).frame(width: 78, height: 78).overlay(Circle().fill(.white).padding(7)) }
                         .disabled(!camera.ready).opacity(camera.ready ? 1 : 0.45).accessibilityLabel("Take photo")
-                    VStack(spacing: 7) { Image(systemName: "sparkles").font(.title2); Text("SHOOT FIRST").font(.system(size: 9, weight: .semibold)).tracking(1) }.frame(maxWidth: .infinity).foregroundStyle(.white.opacity(0.55))
+                    Button { camera.flip() } label: { VStack(spacing: 7) { Image(systemName: "arrow.triangle.2.circlepath.camera").font(.title2); Text("FLIP").font(.system(size: 9, weight: .semibold)).tracking(1) } }.frame(maxWidth: .infinity).disabled(!camera.ready).accessibilityLabel("Switch front or back camera")
                 }.foregroundStyle(.white).padding(.vertical, 24)
             }
         }
@@ -236,6 +284,7 @@ struct EditorScreen: View {
     @State private var showDelete = false
     @State private var status: String?
     @State private var busy = false
+    @State private var autoBusy = false
     private let names = ["Exposure", "Contrast", "Color", "Warmth", "Highlights", "Shadows"]
     var body: some View {
         VStack(spacing: 0) {
@@ -251,7 +300,7 @@ struct EditorScreen: View {
                 }
                 HStack { Text(names[selected]).font(.subheadline); Spacer(); Text(value.wrappedValue, format: .number.precision(.fractionLength(2))).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                 Slider(value: value, in: range).tint(.orange)
-                HStack { Button("Reset") { item.adjustments = Adjustments() }; Spacer(); Button { export() } label: { Label(busy ? "Saving…" : "Save to Photos", systemImage: "square.and.arrow.down") }.disabled(busy) }.font(.subheadline.weight(.medium))
+                HStack { Button(autoBusy ? "Adjusting…" : "Auto") { autoAdjust() }.disabled(autoBusy); Button("Reset") { item.adjustments = Adjustments() }; Spacer(); Button { export() } label: { Label(busy ? "Saving…" : "Save to Photos", systemImage: "square.and.arrow.down") }.disabled(busy) }.font(.subheadline.weight(.medium))
             }.padding(20).background(Color(white: 0.1))
         }.background(.black).navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .principal) { Text(item.date, style: .date).font(.subheadline) }; ToolbarItem(placement: .topBarTrailing) { Button(role: .destructive) { showDelete = true } label: { Image(systemName: "trash") } } }
@@ -279,6 +328,15 @@ struct EditorScreen: View {
     }
     private var range: ClosedRange<Double> {
         switch selected { case 0: return -2...2; case 1: return 0.5...1.5; case 2: return 0...2; case 3: return -1...1; default: return 0...1 }
+    }
+    private func autoAdjust() {
+        autoBusy = true
+        let url = library.url(item)
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { Renderer.automaticAdjustments(url: url) }.value
+            autoBusy = false
+            if let result = result { item.adjustments = result } else { status = "Could not analyze this photo." }
+        }
     }
     private func export() {
         busy = true
