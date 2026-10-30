@@ -21,6 +21,7 @@ targets:
         INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: Luma saves exported photographs to your photo library.
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
     scheme:
       testTargets: []
 
